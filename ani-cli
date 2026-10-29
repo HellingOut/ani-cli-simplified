@@ -4,34 +4,36 @@ version_number="5.1.6"
 
 # UI
 
-# shellcheck disable=SC2086
-# $1 = prompt, $2 = multi select flag (for fzf/rofi), $3 = extra flags by user
-menu() {
-    case "$menu_program" in
-        fzf) fzf --reverse --cycle --prompt "$1" $2 $3 ;;
-        rofi) rofi -sort -dmenu -i -p "$1" $2 $3 ;;
-        dmenu) dmenu -l 20 -p "$1" $3 ;;
-        *) "$menu_program" $3 "$1" ;;
-    esac
-}
-
-# provide menu. input format is either (ep_list) or (number \t anime_id \t anime_name)
+# console menu. input format is either (ep_list) or (number \t anime_id \t anime_name)
+# prints the selected entry as (anime_id \t anime_name), or the raw line(s) for ep lists
 nth() {
     _stdin=$(cat -)
     [ -z "$_stdin" ] && return 1
     _line_count="$(printf "%s\n" "$_stdin" | wc -l | tr -d "[:space:]")"
     [ "$_line_count" -eq 1 ] && printf "%s" "$_stdin" | cut -f 2,3 && return 0
     _prompt="$1"
-    [ $# -ne 1 ] && _multi_flag="$2"
-    _line=$(printf "%s" "$_stdin" | cut -f 1,3 | tr '\t' ' ' | menu "$_prompt" "$_multi_flag" "$menu_extra_flags" | cut -d " " -f 1)
-    _line_start=$(printf "%s" "$_line" | head -n 1)
-    _line_end=$(printf "%s" "$_line" | tail -n 1)
-    [ -n "$_line" ] || return 1
-    if [ "$_line_start" = "$_line_end" ]; then
-        printf "%s" "$_stdin" | grep -E '^'"${_line}"'($|[[:space:]])' | cut -f 2,3 || return 1
-    else
-        printf "%s" "$_stdin" | sed -n '/^'"${_line_start}"'$/,/^'"${_line_end}$"'/p' || return 1
-    fi
+    # the list goes to stdout so it can be piped into the selection reader,
+    # only the prompt and the user's own input go to stderr
+    while :; do
+        printf "%s\n" "$_stdin" | nl -w 3 | sed 's/^[[:space:]]*//'
+        printf "\n\033[1;36m%s (number or text, empty input cancels): \033[0m" "$_prompt" >&2
+        read -r _selection </dev/tty || return 1
+        [ -z "$_selection" ] && return 1
+        # numeric input selects a single entry
+        if [ "$_selection" -eq "$_selection" ] 2>/dev/null; then
+            [ "$_selection" -ge 1 ] 2>/dev/null && [ "$_selection" -le "$_line_count" ] 2>/dev/null || continue
+            _result=$(printf "%s\n" "$_stdin" | sed -n "${_selection}p")
+            break
+        fi
+        # text input filters the list, first match is selected
+        _result=$(printf "%s\n" "$_stdin" | grep -i -m 1 -- "$(printf "%s" "$_selection" | sed 's/[][\.^$*\/&|]/\\&/g')")
+        [ -n "$_result" ] && break
+    done
+    # episode lists come as bare numbers, anime entries as (num \t id \t title)
+    case "$_result" in
+        *"$(printf '\t')"*) printf "%s" "$_result" | cut -f 2,3 ;;
+        *) printf "%s" "$_result" ;;
+    esac
 }
 
 die() {
@@ -53,20 +55,12 @@ help_info() {
     Options:
       -c, --continue
         Continue watching from history
-      -d, --download
-        Download the video instead of playing it
       -D, --delete
         Delete history
-      -l, --logview
-        Show logs
-      -s, --syncplay
-        Use Syncplay to watch with friends
       -S, --select-nth
         Select nth entry
       -q, --quality
         Specify the video quality
-      -v, --vlc
-        Use VLC to play the video
       -V, --version
         Show the version of the script
       -h, --help
@@ -74,29 +68,19 @@ help_info() {
       -e, --episode, -r, --range
         Specify the number of episodes to watch
       --dub
-        Play dubbed version
-      --rofi
-        Use rofi instead of fzf for the interactive menu
-      --dmenu
-        Use dmenu instead of fzf for the interactive menu
-      --skip
-        Use ani-skip to skip the intro of the episode (mpv only)
-      --no-detach
-        Don't detach the player (useful for in-terminal playback, mpv only)
-      --exit-after-play
-        Exit the player, and return the player exit code (useful for non interactive scenarios)
+        Get dubbed version
       -N, --nextep-countdown
         Display a countdown to the next episode
       -U, --update
         Update the script
     Some example usages:
       %s -q 720p banana fish
-      %s --skip -S 2 one piece
-      %s -d -e 2 cyberpunk edgerunners
-      %s --vlc cyberpunk edgerunners -q 1080p -e 4
+      %s -S 2 one piece
+      %s -e 2 cyberpunk edgerunners
+      %s -q 1080p -e 4 cyberpunk edgerunners
       %s blue lock -e 5-6
       %s -e \"5 6\" blue lock
-    \n" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}"
+    \n" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}"
     exit 0
 }
 
@@ -142,7 +126,6 @@ dep_ch_failover() {
 }
 
 cleanup() {
-    [ "$player_function" = "android_mpv" ] && : >"/storage/emulated/0/mpv/mpv.config.mp4" 2>/dev/null
     tput sgr0               # clears colors
     rm -f "${histfile}.new" # remove temp logfile
 }
@@ -227,7 +210,7 @@ hianime_m3u8() {
     _hash="$(printf "%s\n" "$_servers" | sed -nE 's|.*data-type="'"$2"'".*data-server-name="ZokoAnime".*data-hash="([^"]*)".*|\1|p' | head -n 1)"
     _embed="$(b64_decode "$_hash")"
     [ -z "$_embed" ] && return 1
-    # the stream host wants the embed site as referer, and the embed url carries the mal id for ani-skip
+    # the stream host wants the embed site as referer, and the embed url carries the mal id
     refr="$(printf "%s" "$_embed" | sed -E 's|^(https?://[^/]*).*|\1/|')"
     mal_id="$(printf "%s" "$_embed" | sed -nE 's|.*/mal/([0-9]+)/.*|\1|p')"
     _blob="$(hianime_curl "$_embed" | sed -nE 's|.*window\.__P="([^"]*)".*|\1|p')"
@@ -341,77 +324,15 @@ update_history() {
     mv "${histfile}.new" "$histfile"
 }
 
-# PLAYING
+# VIDEO LINK OUTPUT
 
-# shellcheck disable=SC2086
-# $1 = video link, $2 = video name, $3 = extra flags
-download() {
-    _name="$(printf "%s" "$2" | tr '<>:"/\\|?*' '_')"
-    [ -n "$sub_link" ] && $curl_exe -sL -A "$agent" -e "$refr" --max-time 10 $cipher_flag "$sub_link" -o "$download_dir/$_name.vtt"
-    [ -z "$audio_link" ] && command -v "yt-dlp" >/dev/null && yt-dlp --referer "$refr" "$1" --no-skip-unavailable-fragments --fragment-retries infinite -N 16 -o "$download_dir/$_name.mp4" $3 && return 0
-    ffmpeg -extension_picky 0 -referer "$refr" -loglevel error -stats -i "$1" ${audio_link:+-extension_picky 0 -referer "$refr" -i "$audio_link"} -c copy "$download_dir/$_name.mp4" $3
-}
-
-# mpv-android takes no options from the intent, so they go through a file the user includes in mpv.conf
-# shellcheck disable=SC2086
-android_mpv() {
-    _conf_dir="/storage/emulated/0/mpv"
-    if [ -w "${_conf_dir%/mpv}" ]; then
-        [ -d "$_conf_dir" ] || mkdir "$_conf_dir"
-        printf "referrer=%s\n%s\n%s\n" "$refr" "${sub_link:+sub-file=$sub_link}" "${audio_link:+audio-file=$audio_link}" >"$_conf_dir/mpv.config.mp4"
-    fi
-    nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n is.xyz.mpv/.MPVActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 &
-}
-
-play_episode() {
-    [ "$log_episode" = 1 ] && [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && command -v logger >/dev/null && logger -t ani-cli "${anime_title} ${ep_no}"
+print_video_link() {
     [ -z "$video_link" ] && get_video_link
-    [ "$skip_intro" = 1 ] && skip_flag="$(ani-skip -i "$mal_id" -e "$ep_no")"
-    # wait for the previous player to close (in range selection)
-    wait
-    # shellcheck disable=SC2086
-    case "$player_function" in
-        debug) printf "All links:\n%s\nSelected link:\n%s\nAudio:\n%s\nSubtitles:\n%s\n" "$links" "$video_link" "$audio_link" "$sub_link" ;;
-        android_mpv) android_mpv ;;
-        android_vlc) nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 & ;;
-        *flatpak*mpv*) flatpak run io.mpv.Mpv --referrer="$refr" ${audio_link:+--audio-file="$audio_link"} ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;
-        *mpv*)
-            if [ "$no_detach" = 0 ]; then
-                nohup $player_function --referrer="$refr" ${audio_link:+--audio-file="$audio_link"} ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
-            else
-                $player_function --referrer="$refr" ${audio_link:+--audio-file="$audio_link"} ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link"
-                mpv_exitcode=$?
-                [ "$exit_after_play" = 1 ] && [ -z "$_range" ] && exit "$mpv_exitcode"
-            fi
-            ;;
-        *iina*)
-            # mpv splits sub-files on ':', so the url has to be escaped for iina
-            _sub_iina="$(printf "%s" "$sub_link" | sed 's|:|\\:|g')"
-            _audio_iina="$(printf "%s" "$audio_link" | sed 's|:|\\:|g')"
-            if pgrep -f "IINA" >/dev/null 2>&1; then
-                # omit --keep-running when an IINA instance exists to prevent hanging
-                nohup $player_function --mpv-referrer="$refr" ${_audio_iina:+--mpv-audio-files="$_audio_iina"} ${_sub_iina:+--mpv-sub-files="$_sub_iina"} $player_extra_flags --no-stdin --mpv-force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
-            else
-                nohup $player_function --mpv-referrer="$refr" ${_audio_iina:+--mpv-audio-files="$_audio_iina"} ${_sub_iina:+--mpv-sub-files="$_sub_iina"} $player_extra_flags --no-stdin --keep-running --mpv-force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
-            fi
-            ;;
-        *vlc*) nohup $player_function --http-referrer="$refr" $player_extra_flags --play-and-exit --meta-title="${anime_title} Episode ${ep_no}" "$video_link" :input-slave="${audio_link:+$audio_link#}$sub_link" >/dev/null 2>&1 & ;;
-        *yncpla*) nohup $player_function $player_extra_flags "$video_link" -- $skip_flag --referrer="$refr" ${audio_link:+--audio-file="$audio_link"} ${sub_link:+--sub-file="$sub_link"} --force-media-title="${anime_title} Episode ${ep_no}" >/dev/null 2>&1 & ;;
-        download) "$player_function" "$video_link" "${anime_title} Episode ${ep_no}" $player_extra_flags ;;
-        catt) nohup catt cast $player_extra_flags "$video_link" >/dev/null 2>&1 & ;;
-        iSH)
-            printf "\033]8;;vlc://%s\a~~~~~~~~~~~~~~~~~~~~\n~ Tap to open VLC ~\n~~~~~~~~~~~~~~~~~~~~\033]8;;\a\n" "$video_link"
-            sleep 5
-            ;;
-        *) nohup $player_function $player_extra_flags "$video_link" >/dev/null 2>&1 & ;;
-    esac
-    replay="$video_link"
-    unset video_link
+    printf "%s\n" "$video_link"
     update_history
-    [ "$menu_program" != "fzf" ] && wait
 }
 
-play() {
+fetch_episode_links() {
     _start=$(printf "%s" "$ep_no" | grep -Eo '^(-1|[0-9]+(\.[0-9]+)?)')
     _end=$(printf "%s" "$ep_no" | grep -Eo '(-1|[0-9]+(\.[0-9]+)?)$')
     [ "$_start" = "-1" ] && ep_no=$(printf "%s" "$ep_list" | tail -n 1) && unset _start
@@ -425,18 +346,14 @@ play() {
         _range=$(printf "%s\n" "$ep_list" | sed -nE "/^${_start}\$/,/^${_end}\$/p")
         [ -z "$_range" ] && die "Invalid range!"
         for i in $_range; do
-            tput clear
             ep_no=$i
-            info "Playing episode $ep_no..."
-            [ "$i" = "$_end" ] && unset _range
-            play_episode
+            info "Fetching episode $ep_no..."
+            print_video_link
         done
     else
         printf "%s" "$ep_list" | grep -q "^$ep_no$" || die "Invalid episode!"
-        play_episode
+        print_video_link
     fi
-    # moves up to stored position and deletes to end
-    [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && tput rc && tput ed
 }
 
 # MAIN
@@ -451,39 +368,15 @@ tls13_ciphers='TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY13
 agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 mode="${ANI_CLI_MODE:-sub}"
-download_dir="${ANI_CLI_DOWNLOAD_DIR:-.}"
-log_episode="${ANI_CLI_LOG:-1}"
 quality="${ANI_CLI_QUALITY:-best}"
 exact_match="${ANI_CLI_EXACT:-0}"
 
 curl_exe=$(dep_ch_failover "curl_firefox135,curl_chrome136,curl_chrome116,curl_ff117,curl") || die "Program curl not found"
 
+# some builds of curl need explicit cipher lists to pass the TLS fingerprinting checks
 case "$(uname -a | cut -d " " -f 1,3-)" in
-    *Darwin*)
-        cipher_flag="--ciphers $ciphers --tls13-ciphers $tls13_ciphers"
-        player_function="${ANI_CLI_PLAYER:-$(dep_ch_failover "iina,/Applications/IINA.app/Contents/MacOS/iina-cli,mpv,vlc")}" || die 'No player found. Looked for iina, mpv and vlc'
-        ;;                                                            # mac OS
-    *ndroid*) player_function="${ANI_CLI_PLAYER:-android_mpv}" ;;     # Android OS (termux)
-    *MINGW* | *WSL2*) player_function="${ANI_CLI_PLAYER:-mpv.exe}" ;; # Windows OS
-    *ish*)
-        player_function="${ANI_CLI_PLAYER:-iSH}"
-        curl_exe=$(dep_ch_failover "curl_safari260_ios,$curl_exe")
-        ;;                                                                                                                                                                                               # iOS (iSH)
-    *) player_function="${ANI_CLI_PLAYER:-$(dep_ch_failover "mpv,$HOME/.local/share/flatpak/app/io.mpv.Mpv/,/var/lib/flatpak/app/io.mpv.Mpv/,vlc")}" || die 'No player found. Looked for mpv and vlc' ;; # Linux OS
+    *Darwin*) cipher_flag="--ciphers $ciphers --tls13-ciphers $tls13_ciphers" ;; # mac OS
 esac
-
-player_extra_flags="${ANI_CLI_PLAYER_FLAGS:-""}"
-no_detach="${ANI_CLI_NO_DETACH:-0}"
-exit_after_play="${ANI_CLI_EXIT_AFTER_PLAY:-0}"
-skip_intro="${ANI_CLI_SKIP_INTRO:-0}"
-menu_program="${ANI_CLI_MENU:-fzf}"
-menu_extra_flags="${ANI_CLI_MENU_FLAGS:-""}"
-
-# not opening from a terminal
-if [ ! -t 0 ]; then
-    command -v dmenu >/dev/null && menu_program=dmenu
-    command -v rofi >/dev/null && menu_program=rofi
-fi
 
 hist_dir="${ANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ani-cli}"
 [ ! -d "$hist_dir" ] && mkdir -p "$hist_dir"
@@ -495,24 +388,6 @@ branch="${ANI_CLI_BRANCH:-master}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        -v | --vlc)
-            case "$(uname -a | cut -d " " -f 1,3-)" in
-                *ndroid*) player_function="android_vlc" ;;
-                MINGW* | *WSL2*) player_function="vlc.exe" ;;
-                *ish*) player_function="iSH" ;;
-                *) player_function="vlc" ;;
-            esac
-            ;;
-        -s | --syncplay)
-            case "$(uname -s)" in
-                Darwin*) player_function="/Applications/Syncplay.app/Contents/MacOS/syncplay" ;;
-                MINGW* | *Msys)
-                    export PATH="$PATH":"/c/Program Files (x86)/Syncplay/"
-                    player_function="syncplay.exe"
-                    ;;
-                *) player_function="syncplay" ;;
-            esac
-            ;;
         -q | --quality)
             [ $# -lt 2 ] && die "missing argument!"
             quality="$2"
@@ -524,19 +399,8 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         -c | --continue) source=history ;;
-        -d | --download)
-            player_function=download
-            ;;
         -D | --delete)
             : >"$histfile"
-            exit 0
-            ;;
-        -l | --logview)
-            case "$(uname -s)" in
-                Darwin*) log show --predicate 'process == "logger"' ;;
-                Linux*) journalctl -t ani-cli ;;
-                *) die "Logger not implemented for your platform" ;;
-            esac
             exit 0
             ;;
         -V | --version) version_info ;;
@@ -547,11 +411,6 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --dub) mode="dub" ;;
-        --no-detach) no_detach=1 ;;
-        --exit-after-play) exit_after_play=1 && no_detach=1 ;;
-        --rofi) menu_program=rofi ;;
-        --dmenu) menu_program=dmenu ;;
-        --skip) skip_intro=1 ;;
         -N | --nextep-countdown) source=nextep ;;
         -U | --update)
             dep_ch "patch"
@@ -563,23 +422,9 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-[ "$menu_program" = "fzf" ] && menu_multi_flag="-m"
-[ "$menu_program" = "rofi" ] && menu_multi_flag="-multi-select"
-
 info "Checking dependencies..."
 dep_ch "sed"
 dep_ch "grep"
-[ "$skip_intro" = 1 ] && dep_ch "ani-skip"
-dep_ch "$menu_program" # TODO: use dep_ch_failover to iterate through options
-
-case "$player_function" in
-    debug) ;;
-    download) dep_ch_failover "yt-dlp,ffmpeg" >/dev/null || die 'Neither yt-dlp nor ffmpeg found' ;;
-    android*) printf "\33[2K\rChecking of players on Android is disabled.\nmpv needs include=\"/storage/emulated/0/mpv/mpv.config.mp4\" in its mpv.conf, see the readme.\n" ;;
-    *iSH*) printf "\33[2K\rChecking of players on iOS is disabled\n" ;;
-    *flatpak*mpv*) dep_ch "flatpak" ;;
-    *) dep_ch "$player_function" ;;
-esac
 
 # idk where to put this, so I put it here...
 trap 'cleanup; exit 1' INT HUP TERM
@@ -600,14 +445,9 @@ case "$source" in
         ep_no=$(printf "%s" "$anime_list" | grep "^$anime_id	" | sed -nE 's/.*- episode (.+)$/\1/p')
         ;;
     *)
-        if [ "$menu_program" = "fzf" ]; then
-            while [ -z "$query" ]; do
-                printf "\33[2K\r\033[1;36mSearch anime: \033[0m" && read -r query
-            done
-        else
-            [ -z "$query" ] && query=$(: | menu "Search anime: " "" "$menu_extra_flags")
-            [ -z "$query" ] && exit 1
-        fi
+        while [ -z "$query" ]; do
+            printf "\033[1;36mSearch anime: \033[0m" && read -r query
+        done
         # for checking new releases by specifying anime name
         [ "$source" = "nextep" ] && time_until_next_ep "$query"
 
@@ -631,39 +471,16 @@ case "$source" in
         anime_id="$(printf "%s" "$result" | cut -f 1)"
         episode_maps="$(hianime_episodes "$anime_id")" || exit 1
         ep_list="$(printf '%s' "$episode_maps" | cut -f 2)"
-        [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$menu_multi_flag")
+        [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Select episode: ")
         [ -z "$ep_no" ] && die "Invalid episode selection"
         ;;
 esac
 
 # moves the cursor up one line and clears that line
 tput cuu1 && tput el
-# stores the position of cursor
-tput sc
 
-# playback & loop
-play
-[ "$player_function" = "download" ] || [ "$player_function" = "debug" ] && exit 0
-
-while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nquit" | nth "Playing episode $ep_no of $anime_title... "); do
-    case "$cmd" in
-        next) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null ;;
-        replay) video_link="$replay" ;;
-        previous) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null ;;
-        select) ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$menu_multi_flag") ;;
-        change_quality)
-            new_quality="$(printf "%s" "$links" | menu "Select Quality: " "" "$menu_extra_flags" | cut -d ">" -f 1)"
-            [ -z "$new_quality" ] && die "No quality selected"
-            select_quality "$new_quality"
-            ;;
-        *)
-            cleanup
-            exit 0
-            ;;
-    esac
-    [ -z "$ep_no" ] && die "Out of range"
-    play
-done
+# fetch the link(s) of the selected episode(s)
+fetch_episode_links
 
 # ani-cli
 #
